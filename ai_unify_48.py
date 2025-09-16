@@ -18,7 +18,7 @@ import numpy as np
 
 # ===================== CONFIG =====================
 PROFILE_CSV = r"D:\ovf\_HAWKAR\python\profiles\profile_by_file_sheet_col.csv"
-LONG_CSV    = r"D:\ovf\_HAWKAR\python\all_sheets_first10_long.csv"
+LONG_CSV    = r"https://github.com/AIforimpact22/waterproject/blob/main/all_sheets_first10_long.csv"
 OUT_DIR     = r"D:\ovf\_HAWKAR\python\unified"
 OUT_UNIFIED = os.path.join(OUT_DIR, "unified_48cols.csv")
 OUT_MAP     = os.path.join(OUT_DIR, "mapping_used.json")
