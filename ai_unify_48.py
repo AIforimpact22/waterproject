@@ -18,7 +18,7 @@ import numpy as np
 
 # ===================== CONFIG =====================
 PROFILE_CSV = r"D:\ovf\_HAWKAR\python\profiles\profile_by_file_sheet_col.csv"
-LONG_CSV    = r"https://github.com/AIforimpact22/waterproject/blob/main/all_sheets_first10_long.csv"
+LONG_CSV    = r"D:\ovf\_HAWKAR\python\all_sheets_first10_long.csv"
 OUT_DIR     = r"D:\ovf\_HAWKAR\python\unified"
 OUT_UNIFIED = os.path.join(OUT_DIR, "unified_48cols.csv")
 OUT_MAP     = os.path.join(OUT_DIR, "mapping_used.json")
@@ -31,7 +31,7 @@ OPENAI_KEY   = os.environ.get("OPENAI_API_KEY")
 # AI behavior
 AI_TIMEOUT_SEC = int(os.environ.get("AI_TIMEOUT_SEC", "12"))   # per chunk
 AI_MAX_CHUNKS  = int(os.environ.get("AI_MAX_CHUNKS", "10"))    # safety cap
-AI_CHUNK_SIZE  = int(os.environ.get("AI_CHUNK_SIZE", "60"))    # smaller chunk to keep calls fast
+AI_CHUNK_SIZE  = int(os.environ.get("AI_CHUNK_SIZE", "60"))    # tuned to avoid blocking
 AI_MODE        = os.environ.get("AI_MODE", "ambiguous_only")   # "ambiguous_only" | "always" | "disabled"
 
 # ================== Canonical Schema ==================
@@ -124,7 +124,6 @@ HARD_LOCK_MAP: Dict[str, str] = {
     "TELEPULES_KAT": "telepules",
     "TELEPÜLÉS_TELEP ": "telepules",
 }
-
 RESTRICTED_ALLOWED_CANON: Dict[str, List[str]] = {
     "SZURO_H": ["szuro_hossz_m"],
     "SZURO_A": ["szuro_teteje_m"],
@@ -135,7 +134,6 @@ RESTRICTED_ALLOWED_CANON: Dict[str, List[str]] = {
     "MAX_TALP": ["talp_m"],
     "VGT1_ObjAz": [],  # never allow to map to vor_kod
 }
-
 SOURCE_PREF_NUM: Dict[str, List[str]] = {
     "szuro_hossz_m": ["SZURO_H"],
     "szuro_teteje_m": ["SZURO_A"],
@@ -151,7 +149,6 @@ SOURCE_PREF_NUM: Dict[str, List[str]] = {
     "homerseklet_c": ["HOMERS"],
     "hozam_lperc": ["HOZAM"],
 }
-
 SOURCE_PREF_TEXT: Dict[str, List[str]] = {
     "telep_nev": ["HELYI NÉV","HELYI_NÉV","HELYI_NEV","HELYI_NEV (Telep neve)","Telep"],
     "telepules": ["TELEPÜLÉS","TELEPULES","Település","Telep település","TELEPULES_KAT","TELEPÜLÉS_TELEP "],
@@ -167,7 +164,6 @@ SOURCE_PREF_TEXT: Dict[str, List[str]] = {
     "uzem_engedely_szam": ["ÜZ.ENG.","UZENG","UZENGSZAM","UZENG_SZAM_2015","UZENG_TELEP","UZENGSZAM (telep)"],
     "engedely_szam": ["Engedélyszám","Engedélyszám_Gkód","ÜZENG"],
 }
-
 NUM_TOL: Dict[str, Tuple[float, float]] = {
     "szuro_hossz_m": (1.0, 0.10),
     "szuro_teteje_m": (0.5, 0.05),
@@ -200,8 +196,13 @@ def normalize_header(raw: str) -> str:
     return s
 
 def normalize_value_str(v) -> str:
-    if v is None or (isinstance(v, float) and math.isnan(v)):
+    if v is None:
         return ""
+    try:
+        if pd.isna(v):
+            return ""
+    except Exception:
+        pass
     return str(v).replace("\u00A0", " ").strip()
 
 def looks_numeric_token(s: str) -> bool:
@@ -212,10 +213,16 @@ def looks_numeric_token(s: str) -> bool:
         return False
     return bool(re.search(r"\d", s1))
 
-def parse_number_hu_safe(s: str) -> Optional[float]:
-    if not s:
+def parse_number_hu_safe(s) -> Optional[float]:
+    # Robust to pd.NA / NaN / None and strings
+    if s is None:
         return None
-    s0 = s.strip()
+    try:
+        if pd.isna(s):
+            return None
+    except Exception:
+        pass
+    s0 = str(s).strip()
     m = re.match(r"^[A-Za-z]{1,3}[-/ ]+(\d+)$", s0)  # "K-28" -> 28
     if m:
         try:
@@ -326,7 +333,6 @@ REGEX_RULES = [
     (r"^(VizhasznAlkat|VizhasznFokat.*)$", "vizhasznalat_alkat"),
     (r"^Megjegyzés.*$|^VIZIG megjegyzés$", "megjegyzes"),
 ]
-
 def regex_map_header(h: str) -> Optional[str]:
     if h in HARD_LOCK_MAP:
         return HARD_LOCK_MAP[h]
@@ -356,75 +362,50 @@ def _init_openai_clients():
 
 def _ai_call_messages(messages: List[dict], response_format_json: bool = True) -> str:
     if _client_new:
-        kwargs = {
-            "model": OPENAI_MODEL,
-            "temperature": 0.0,
-            "messages": messages,
-        }
+        kwargs = {"model": OPENAI_MODEL, "temperature": 0.0, "messages": messages}
         if response_format_json:
             kwargs["response_format"] = {"type": "json_object"}
         resp = _client_new.chat.completions.create(**kwargs)
         return resp.choices[0].message.content
     elif _client_old:
-        resp = _client_old.ChatCompletion.create(
-            model=OPENAI_MODEL,
-            temperature=0.0,
-            messages=messages,
-        )
+        resp = _client_old.ChatCompletion.create(model=OPENAI_MODEL, temperature=0.0, messages=messages)
         return resp["choices"][0]["message"]["content"]
     else:
         raise RuntimeError("OpenAI client not initialized")
 
 def ai_make_mapping_ambiguous(raw_headers: List[str], context_rows: pd.DataFrame,
                               heur_map: Dict[str, Optional[str]]) -> Dict[str, Optional[str]]:
-    """
-    Ask AI only for headers we couldn't confidently map with heuristics or that are risky.
-    Enforces timeout per chunk and falls back silently if AI is unavailable.
-    """
-    # Determine ambiguous headers
     ambiguous = []
     for h in raw_headers:
         hm = heur_map.get(h)
         if hm is None or hm not in CANONICAL_48:
             ambiguous.append(h)
 
-    # Respect AI mode
     if AI_MODE.lower() == "disabled" or not OPENAI_KEY:
         print("⚙️  AI mapping disabled or no key; using heuristics only.")
         return {}
 
-    if AI_MODE.lower() == "always":
-        to_query = raw_headers
-    else:
-        to_query = ambiguous
-
+    to_query = raw_headers if AI_MODE.lower() == "always" else ambiguous
     if not to_query:
         print("🧭 No ambiguous headers; heuristics fully covered.")
         return {}
 
-    # Prepare context hints
     keep_cols = [c for c in ["column_name","inferred_type","files_count","sheets_count","top_values"] if c in context_rows.columns]
-    if keep_cols:
-        hints_df = context_rows[keep_cols].copy()
-    else:
-        hints_df = pd.DataFrame(columns=["column_name","inferred_type","files_count","sheets_count","top_values"])
+    hints_df = context_rows[keep_cols].copy() if keep_cols else pd.DataFrame(columns=["column_name","inferred_type","files_count","sheets_count","top_values"])
 
-    # Init client
     _init_openai_clients()
     if not (_client_new or _client_old):
         print("⚠️  OpenAI SDK not available; fallback to heuristics only.")
         return {}
 
-    # Build canonical description payload once
     canonical_list = [{"name": c, "desc": CANON_DESC.get(c, "")} for c in CANONICAL_48]
-
     ai_map: Dict[str, Optional[str]] = {}
     chunks = [to_query[i:i+AI_CHUNK_SIZE] for i in range(0, len(to_query), AI_CHUNK_SIZE)]
-    chunks = chunks[:AI_MAX_CHUNKS]  # safety cap
+    chunks = chunks[:AI_MAX_CHUNKS]
     total = len(chunks)
+
     with ThreadPoolExecutor(max_workers=1) as pool:
         for idx, chunk in enumerate(chunks, 1):
-            # Minimal context for chunk
             ctx = hints_df[hints_df["column_name"].isin(chunk)].copy() if not hints_df.empty else pd.DataFrame()
             hints = []
             for _, r in ctx.iterrows():
@@ -435,7 +416,6 @@ def ai_make_mapping_ambiguous(raw_headers: List[str], context_rows: pd.DataFrame
                     "sheets": r.get("sheets_count",""),
                     "examples": str(r.get("top_values",""))[:160]
                 })
-
             system_msg = (
                 "You are a data integration expert. Map messy headers to EXACTLY one of the 48 canonical fields "
                 "(snake_case list provided). Return ONLY JSON: {\"map\": {\"raw\": \"canonical\"|null}}. "
@@ -444,10 +424,7 @@ def ai_make_mapping_ambiguous(raw_headers: List[str], context_rows: pd.DataFrame
                 "Never map VGT1_ObjAz to vor_kod. If unsure, return null."
             )
             user_payload = {"canonical": canonical_list, "raw_headers": chunk, "profile_hints": hints}
-            messages = [
-                {"role":"system","content": system_msg},
-                {"role":"user","content": json.dumps(user_payload, ensure_ascii=False)}
-            ]
+            messages = [{"role":"system","content": system_msg},{"role":"user","content": json.dumps(user_payload, ensure_ascii=False)}]
 
             print(f"🤖 AI mapping chunk {idx}/{total} (size={len(chunk)}) …", flush=True)
             future = pool.submit(_ai_call_messages, messages, True)
@@ -466,7 +443,6 @@ def ai_make_mapping_ambiguous(raw_headers: List[str], context_rows: pd.DataFrame
             except Exception as e:
                 print(f"⚠️  AI mapping error on chunk {idx}: {e}; continuing.", flush=True)
             time.sleep(0.2)
-
     return ai_map
 
 # ================= Coercion / Casting =================
@@ -480,15 +456,18 @@ def coerce_to_canonical(col: str, series: pd.Series) -> pd.Series:
         "szuro_teteje_m","szuro_alja_m","szuro_hossz_m","szuro_db",
         "nyugalmi_vizszint_m","uzemi_vizszint_m","homerseklet_c",
         "hozam_lperc","enged_termeles_m3nap","lekotes_ezer_m3ev","lekotes_m3nap",
-        "ev","ho","nap","vizig","objszam","letesites_eve","csoortsza","csoportszam"
+        "ev","ho","nap","vizig","objszam","letesites_eve","csoportszam"
     }
     if col in numeric_cols or col == "termeles_ezer_m3ev":
+        # Safe for pd.NA: mapper returns None -> float64 -> NaN
         arr = s.astype("string").map(parse_number_hu_safe).astype("float64")
         if col == "termeles_ezer_m3ev":
-            if arr.notna().sum() >= 5 and arr.dropna().quantile(0.90) > 10000:
+            non_null = arr.dropna()
+            if len(non_null) >= 5 and non_null.quantile(0.90) > 10000:
                 arr = arr / 1000.0
         if col == "lekotes_ezer_m3ev":
-            if arr.notna().sum() and arr.dropna().quantile(0.90) > 5000:
+            non_null = arr.dropna()
+            if len(non_null) and non_null.quantile(0.90) > 5000:
                 arr = arr / 1000.0
         return arr
     return s.astype("string").replace({"": pd.NA})
@@ -504,8 +483,11 @@ def cast_integral_in_place(df: pd.DataFrame, cols: List[str]):
 
 # ================= Conflict Selection =================
 def almost_equal(a: float, b: float, tol: Tuple[float, float]) -> bool:
-    if a is None or b is None or (isinstance(a,float) and math.isnan(a)) or (isinstance(b,float) and math.isnan(b)):
+    if a is None or b is None:
         return False
+    if isinstance(a, float) and isinstance(b, float):
+        if not (math.isfinite(a) and math.isfinite(b)):
+            return False
     abs_tol, rel_tol = tol
     if abs(a - b) <= abs_tol:
         return True
@@ -517,8 +499,9 @@ def select_by_source_priority(cands: List[Tuple[str, str]], priority: List[str])
         return None
     for src in priority:
         for s, v in cands:
-            if s == src and normalize_value_str(v):
-                return normalize_value_str(v)
+            vv = normalize_value_str(v)
+            if s == src and vv:
+                return vv
     for _, v in cands:
         vv = normalize_value_str(v)
         if vv:
@@ -545,7 +528,7 @@ def choose_numeric_safe(canonical: str, candidates: List[Tuple[str, Optional[flo
                     "values_raw": "; ".join([str(v) for _,v in cand]),
                     "reason_code": "GENERIC_NUMERIC_CONFLICT", "reason_detail": "Priority source chosen."
                 })
-            return v0
+            return float(v0)
     tol = NUM_TOL.get(canonical, (0.0, 0.0))
     base = cand[0][1]
     if all(almost_equal(base, v, tol) for _, v in cand):
@@ -559,7 +542,7 @@ def choose_numeric_safe(canonical: str, candidates: List[Tuple[str, Optional[flo
         "values_raw": "; ".join([str(v) for _,v in cand]),
         "reason_code": "GENERIC_NUMERIC_CONFLICT", "reason_detail": "Alphabetic source tie-break."
     })
-    return v0
+    return float(v0)
 
 def choose_text_prefer_alpha(canonical: str, candidates: List[Tuple[str, str]],
                              file: str, sheet: str, rid: str, conflicts: List[dict],
@@ -570,13 +553,15 @@ def choose_text_prefer_alpha(canonical: str, candidates: List[Tuple[str, str]],
     if priority:
         pick = select_by_source_priority(cands, priority)
         if pick:
-            uniq = pd.unique([v for _, v in cands])
-            if len(uniq) > 1:
+            vals = [v for _, v in cands]
+            # FIX: avoid FutureWarning by converting to Series first
+            uniq_vals = list(pd.Series(vals, dtype="string").dropna().unique())
+            if len(uniq_vals) > 1:
                 conflicts.append({
                     "file": file, "sheet": sheet, "row_index": rid, "canonical": canonical,
                     "note": "USED_PRIORITY_SOURCE",
                     "raw_columns": "; ".join([s for s,_ in cands]),
-                    "values_raw": "; ".join(list(uniq)[:10]),
+                    "values_raw": "; ".join(uniq_vals[:10]),
                     "reason_code": "TRULY_DIFFERENT_STRINGS", "reason_detail": "Priority textual source."
                 })
             return pick
@@ -587,15 +572,11 @@ def choose_text_prefer_alpha(canonical: str, candidates: List[Tuple[str, str]],
 
 # =============== Build mapping (locks → heuristics → AI) ===============
 def build_final_mapping(all_headers: List[str], prof: pd.DataFrame) -> Dict[str, Optional[str]]:
-    # Heuristics first
     heur_map: Dict[str, Optional[str]] = {h: regex_map_header(h) for h in all_headers}
-
-    # Enforce restricted locks (block unsafe)
     for h, allowed in RESTRICTED_ALLOWED_CANON.items():
         if h in heur_map and allowed and heur_map[h] not in allowed:
             heur_map[h] = None
 
-    # Load cached mapping if exists
     cached: Dict[str, Optional[str]] = {}
     if os.path.exists(OUT_MAP):
         try:
@@ -604,15 +585,12 @@ def build_final_mapping(all_headers: List[str], prof: pd.DataFrame) -> Dict[str,
         except Exception:
             cached = {}
 
-    # Merge cached into heur_map (cached preferred)
     for h in all_headers:
         if h in cached and cached[h] in CANONICAL_48:
             heur_map[h] = cached[h]
 
-    # AI mapping for ambiguous subset (with timeout, chunked)
     ai_map = ai_make_mapping_ambiguous(all_headers, prof, heur_map)
 
-    # Build final map with priority: HARD_LOCK > AI > heuristics > None
     final_map: Dict[str, Optional[str]] = {}
     rejected_ai = 0
     for h in all_headers:
@@ -640,7 +618,6 @@ def build_final_mapping(all_headers: List[str], prof: pd.DataFrame) -> Dict[str,
     if rejected_ai:
         print(f"🔒 Rejected {rejected_ai} unsafe AI suggestions (protected headers).")
 
-    # Save mapping cache for next runs
     ensure_outdir(OUT_DIR)
     with open(OUT_MAP, "w", encoding="utf-8") as f:
         json.dump(final_map, f, ensure_ascii=False, indent=2)
@@ -665,16 +642,13 @@ def main():
     all_headers = sorted(pd.unique(prof["column_name"]).tolist())
     print(f"🔎 Unique raw headers in profiles: {len(all_headers)}", flush=True)
 
-    # Build final mapping (never blocks thanks to timeouts/fallback)
     final_map = build_final_mapping(all_headers, prof)
 
     # Load long values
     long_df = pd.read_csv(
         LONG_CSV,
         dtype={"file":"string","sheet":"string","method":"string","row_index":"string","column_name":"string","value":"string"},
-        na_filter=False,
-        encoding="utf-8-sig",
-        low_memory=False
+        na_filter=False, encoding="utf-8-sig", low_memory=False
     )
     long_df["column_name"] = long_df["column_name"].map(normalize_header)
     long_df["canonical"] = long_df["column_name"].map(final_map).astype("string")
@@ -687,7 +661,6 @@ def main():
     conflicts: List[dict] = []
     out_rows: List[dict] = []
 
-    # Group and resolve
     for (f, sh, rid), sub in kept.groupby(group_keys, sort=False):
         row: Dict[str, Optional[str]] = {"file": f, "sheet": sh, "row_index": rid}
         cands_by_canon: Dict[str, List[Tuple[str, str]]] = {cn: [] for cn in CANONICAL_48}
@@ -695,18 +668,17 @@ def main():
             c = r["canonical"]
             cands_by_canon[c].append((r["column_name"], r["value"]))
 
-        # text (priority and alpha)
+        # text with priorities
         row["telep_nev"]   = choose_text_prefer_alpha("telep_nev",   cands_by_canon["telep_nev"],   f, sh, rid, conflicts, SOURCE_PREF_TEXT.get("telep_nev"))
         row["telepules"]   = choose_text_prefer_alpha("telepules",   cands_by_canon["telepules"],   f, sh, rid, conflicts, SOURCE_PREF_TEXT.get("telepules"))
         row["vizikonyv_szam"] = choose_text_prefer_alpha("vizikonyv_szam", cands_by_canon["vizikonyv_szam"], f, sh, rid, conflicts, SOURCE_PREF_TEXT.get("vizikonyv_szam"))
         row["uzem_engedely_szam"] = choose_text_prefer_alpha("uzem_engedely_szam", cands_by_canon["uzem_engedely_szam"], f, sh, rid, conflicts, SOURCE_PREF_TEXT.get("uzem_engedely_szam"))
         row["engedely_szam"] = choose_text_prefer_alpha("engedely_szam", cands_by_canon["engedely_szam"], f, sh, rid, conflicts, SOURCE_PREF_TEXT.get("engedely_szam"))
 
-        # csoporthely / objcsop_kod
         row["csoporthely"] = select_by_source_priority(cands_by_canon["csoporthely"], SOURCE_PREF_TEXT.get("csoporthely", []))
         row["objcsop_kod"] = select_by_source_priority(cands_by_canon["objcsop_kod"], SOURCE_PREF_TEXT.get("objcsop_kod", []))
 
-        # vor_kod (pattern guard, never from VGT1_ObjAz)
+        # vor_kod
         vor_cands = [(s, v) for s, v in cands_by_canon["vor_kod"] if s != "VGT1_ObjAz"]
         vor_codes = [normalize_value_str(v) for _, v in vor_cands if is_vor_code(v)]
         if vor_codes:
@@ -716,7 +688,7 @@ def main():
         else:
             row["vor_kod"] = None
 
-        # objszám + obj_tipus: OBJSZAM preferred (parse "K-28"), fallback to OBJDB numeric
+        # objszám + obj_tipus
         obj_tp = None
         obj_num = None
         for src, val in cands_by_canon["objszam"]:
@@ -769,19 +741,18 @@ def main():
                 row[cn] = choose_text_prefer_alpha(cn, cands_by_canon.get(cn, []), f, sh, rid, conflicts,
                                                    SOURCE_PREF_TEXT.get(cn, []))
 
-        # domain fix: swap top/bottom if wrong
+        # top/bottom swap if needed
         for top_key, bot_key in [("reteg_teteje_m","reteg_alja_m"), ("szuro_teteje_m","szuro_alja_m")]:
             top = row.get(top_key); bot = row.get(bot_key)
             if isinstance(top, float) and isinstance(bot, float):
-                if not (top is None or bot is None or math.isnan(top) or math.isnan(bot)):
-                    if top > bot:
-                        row[top_key], row[bot_key] = bot, top
+                if (top is not None and bot is not None and math.isfinite(top) and math.isfinite(bot)) and top > bot:
+                    row[top_key], row[bot_key] = bot, top
 
         # derive length if missing
         sh_len, st, sa = row.get("szuro_hossz_m"), row.get("szuro_teteje_m"), row.get("szuro_alja_m")
-        if (sh_len is None or (isinstance(sh_len, float) and math.isnan(sh_len))) and \
+        if (sh_len is None or (isinstance(sh_len, float) and np.isnan(sh_len))) and \
            isinstance(st, float) and isinstance(sa, float) and \
-           st is not None and sa is not None and not math.isnan(st) and not math.isnan(sa):
+           (st is not None and sa is not None and math.isfinite(st) and math.isfinite(sa)):
             d = sa - st
             if 0 <= d <= 1000:
                 row["szuro_hossz_m"] = d
@@ -801,7 +772,6 @@ def main():
     cols = ["file","sheet","row_index"] + CANONICAL_48
     wide = wide[cols]
 
-    # write outputs
     if conflicts:
         pd.DataFrame(conflicts).to_csv(OUT_CONFLICTS, index=False, encoding="utf-8-sig")
         print(f"⚠️  Wrote conflicts: {OUT_CONFLICTS}  ({len(conflicts):,} rows)", flush=True)
@@ -811,7 +781,7 @@ def main():
     wide.to_csv(OUT_UNIFIED, index=False, encoding="utf-8-sig")
     print(f"✅ Wrote unified table: {OUT_UNIFIED}  ({len(wide):,} rows, {len(wide.columns)} cols)", flush=True)
 
-    # lightweight AI validation (optional; guarded by timeout and failures)
+    # AI validation (best-effort)
     try:
         _init_openai_clients()
         if not (_client_new or _client_old) or AI_MODE.lower() == "disabled":
@@ -820,7 +790,7 @@ def main():
         for cn in CANONICAL_48:
             ser = wide[cn]
             notna = int(ser.notna().sum())
-            uniq = int(pd.Series(ser.dropna().astype(str).unique()).shape[0]) if notna else 0
+            uniq = int(pd.Series(ser.dropna().astype(str)).nunique())
             sample = "; ".join([str(x) for x in ser.dropna().astype(str).head(5).tolist()])
             prof2.append({"name": cn, "non_null": notna, "unique": uniq, "sample": sample})
         msg = {
