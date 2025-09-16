@@ -1,40 +1,54 @@
 # -*- coding: utf-8 -*-
-# Robust AI-powered 48-column unifier with timeouts, fallbacks, and cached mapping.
-# Inputs:
-#   Profiles CSV: r"D:\ovf\_HAWKAR\python\profiles\profile_by_file_sheet_col.csv"
-#   Long CSV:     r"D:\ovf\_HAWKAR\python\all_sheets_first10_long.csv"
-# Outputs:
-#   Unified CSV:  r"D:\ovf\_HAWKAR\python\unified\unified_48cols.csv"
-#   Mapping JSON: r"D:\ovf\_HAWKAR\python\unified\mapping_used.json"
-#   Conflicts:    r"D:\ovf\_HAWKAR\python\unified\conflicts_log.csv"
-#   AI Notes:     r"D:\ovf\_HAWKAR\python\unified\ai_validation.md" (best-effort)
+"""
+AI-powered 48-column unifier for the waterproject repo.
+
+Inputs:
+  - LONG CSV (GitHub): https://raw.githubusercontent.com/AIforimpact22/waterproject/main/all_sheets_first10_long.csv
+    (You can override with env: LONG_CSV=<path or URL>)
+
+Outputs (created in ./unified):
+  - unified_48cols.csv        → the 48-column wide table
+  - mapping_used.json         → final raw→canonical header mapping
+  - conflicts_log.csv         → decisions kept for traceability
+  - ai_validation.md          → short AI audit (if OPENAI_API_KEY is available)
+
+Environment (optional):
+  - OPENAI_API_KEY  → enables GPT assistance (header mapping & final audit)
+  - OPENAI_MODEL    → default: gpt-4o-mini (fallbacks handled)
+  - AI_MODE         → ambiguous_only | always | disabled (default: ambiguous_only)
+  - AI_TIMEOUT_SEC  → per AI chunk (default: 12)
+  - AI_CHUNK_SIZE   → raw headers per AI chunk (default: 60)
+  - AI_MAX_CHUNKS   → cap number of chunks (default: 10)
+"""
 
 import os, re, json, time, math, warnings
 from typing import Dict, List, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 
-# ===================== CONFIG =====================
-PROFILE_CSV = r"D:\ovf\_HAWKAR\python\profiles\profile_by_file_sheet_col.csv"
-LONG_CSV    = r"D:\ovf\_HAWKAR\python\all_sheets_first10_long.csv"
-OUT_DIR     = r"D:\ovf\_HAWKAR\python\unified"
-OUT_UNIFIED = os.path.join(OUT_DIR, "unified_48cols.csv")
-OUT_MAP     = os.path.join(OUT_DIR, "mapping_used.json")
+# ---------------------- Config ----------------------
+LONG_CSV = os.environ.get(
+    "LONG_CSV",
+    "https://raw.githubusercontent.com/AIforimpact22/waterproject/main/all_sheets_first10_long.csv"
+)
+
+OUT_DIR       = os.environ.get("OUT_DIR", "./unified")
+OUT_UNIFIED   = os.path.join(OUT_DIR, "unified_48cols.csv")
+OUT_MAP       = os.path.join(OUT_DIR, "mapping_used.json")
 OUT_CONFLICTS = os.path.join(OUT_DIR, "conflicts_log.csv")
-OUT_AI_MD   = os.path.join(OUT_DIR, "ai_validation.md")
+OUT_AI_MD     = os.path.join(OUT_DIR, "ai_validation.md")
 
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_KEY   = os.environ.get("OPENAI_API_KEY")
 
-# AI behavior
-AI_TIMEOUT_SEC = int(os.environ.get("AI_TIMEOUT_SEC", "12"))   # per chunk
-AI_MAX_CHUNKS  = int(os.environ.get("AI_MAX_CHUNKS", "10"))    # safety cap
-AI_CHUNK_SIZE  = int(os.environ.get("AI_CHUNK_SIZE", "60"))    # tuned to avoid blocking
-AI_MODE        = os.environ.get("AI_MODE", "ambiguous_only")   # "ambiguous_only" | "always" | "disabled"
+AI_TIMEOUT_SEC = int(os.environ.get("AI_TIMEOUT_SEC", "12"))
+AI_MAX_CHUNKS  = int(os.environ.get("AI_MAX_CHUNKS", "10"))
+AI_CHUNK_SIZE  = int(os.environ.get("AI_CHUNK_SIZE", "60"))
+AI_MODE        = os.environ.get("AI_MODE", "ambiguous_only")  # ambiguous_only | always | disabled
 
-# ================== Canonical Schema ==================
+# ------------------ Canonical Schema -----------------
 CANONICAL_48 = [
     "vifir_kod","vor_kod","obj_tipus","objszam","objhely",
     "csoporthely","csoportszam","objcsop_kod","gw_kod","vizig",
@@ -48,70 +62,53 @@ CANONICAL_48 = [
     "vizhasznalat","vizhasznalat_alkat","megjegyzes"
 ]
 
+# Description (kept minimal; used for AI hints)
 CANON_DESC = {
-    "vifir_kod":"VIFIR objektum kód",
-    "vor_kod":"VOR kód",
-    "obj_tipus":"Objektum típusa (k/e/h/t)",
-    "objszam":"Objektum sorszám (K-28 → 28)",
-    "objhely":"Objektum hely kód",
-    "csoporthely":"Csoporthely kód",
-    "csoportszam":"Csoportszám",
-    "objcsop_kod":"Objektum csoport kód",
-    "gw_kod":"GW kód",
-    "vizig":"VIZIG azonosító (szám)",
-    "telep_nev":"Telep/üzem név",
-    "telepules":"Település",
-    "irsz":"Irányítószám",
-    "cim":"Cím",
-    "helyrajzi_szam":"Helyrajzi/kataszteri szám",
-    "eov_x":"EOV X",
-    "eov_y":"EOV Y",
-    "tszf_m":"TSZF (m)",
-    "ev":"Év", "ho":"Hónap", "nap":"Nap", "datum":"Dátum (ISO)",
-    "letesites_eve":"Létesítés éve",
-    "viztipus_rt":"Víz típusa (R/T/R+T)",
-    "reteg_teteje_m":"Réteg teteje (m)",
-    "reteg_alja_m":"Réteg alja (m)",
-    "talp_m":"Kút talp (m)",
-    "szuro_teteje_m":"Szűrő teteje (m)",
-    "szuro_alja_m":"Szűrő alja (m)",
-    "szuro_db":"Szűrő darabszám",
-    "szuro_hossz_m":"Szűrő hossza (m)",
-    "nyugalmi_vizszint_m":"Nyugalmi VZ (m)",
-    "uzemi_vizszint_m":"Üzemi VZ (m)",
-    "homerseklet_c":"Víz hőmérséklet (°C)",
-    "hozam_lperc":"Hozam (l/perc)",
-    "termeles_ezer_m3ev":"Termelés (ezer m3/év)",
-    "engedely_szam":"Engedélyszám",
-    "uzem_engedely_szam":"Üzemeltetési engedélyszám",
-    "vizikonyv_szam":"Vizikönyvi szám",
-    "ervenyes_tol":"Érvényesség kezdete",
-    "ervenyes_ig":"Érvényesség vége",
-    "enged_termeles_m3nap":"Engedélyezett termelés (m3/nap)",
-    "lekotes_ezer_m3ev":"Lekötés (ezer m3/év)",
-    "lekotes_m3nap":"Lekötés (m3/nap)",
-    "vkj_kategoria":"VKJ kategória",
-    "vizhasznalat":"Vízhasználat fő kategória",
-    "vizhasznalat_alkat":"Vízhasználat alkategória",
-    "megjegyzes":"Megjegyzés"
+    "vifir_kod":"VIFIR object code",
+    "vor_kod":"VOR code",
+    "obj_tipus":"object type (k/e/h/t/R/T)",
+    "objszam":"object serial number (K-28 → 28)",
+    "objhely":"object place code",
+    "csoporthely":"group place code",
+    "csoportszam":"group number",
+    "objcsop_kod":"object group code",
+    "gw_kod":"GW code",
+    "vizig":"VIZIG id",
+    "telep_nev":"site name",
+    "telepules":"settlement",
+    "irsz":"postal code",
+    "cim":"address",
+    "helyrajzi_szam":"land registry/cadastral no.",
+    "eov_x":"EOV X","eov_y":"EOV Y","tszf_m":"TSZF (m)",
+    "ev":"year","ho":"month","nap":"day","datum":"ISO date",
+    "letesites_eve":"construction year",
+    "viztipus_rt":"water type (R/T/R+T)",
+    "reteg_teteje_m":"layer top (m)","reteg_alja_m":"layer bottom (m)","talp_m":"well bottom (m)",
+    "szuro_teteje_m":"screen top (m)","szuro_alja_m":"screen bottom (m)","szuro_db":"screen count","szuro_hossz_m":"screen length (m)",
+    "nyugalmi_vizszint_m":"static WL (m)","uzemi_vizszint_m":"pumping WL (m)","homerseklet_c":"temp (°C)",
+    "hozam_lperc":"yield (L/min)","termeles_ezer_m3ev":"production (k m³/yr)",
+    "engedely_szam":"permit no.","uzem_engedely_szam":"operating permit no.","vizikonyv_szam":"water-book no.",
+    "ervenyes_tol":"valid from","ervenyes_ig":"valid to",
+    "enged_termeles_m3nap":"permitted prod (m³/day)","lekotes_ezer_m3ev":"commitment (k m³/yr)","lekotes_m3nap":"commitment (m³/day)",
+    "vkj_kategoria":"VKJ category","vizhasznalat":"use (main)","vizhasznalat_alkat":"use (sub)","megjegyzes":"note"
 }
 
-# ======= Locks / Preferences / Tolerances =======
+# Hard/priority mapping & numeric tolerances
 HARD_LOCK_MAP: Dict[str, str] = {
     "SZURO_H": "szuro_hossz_m",
     "SZURO_A": "szuro_teteje_m",
     "SZURO_F": "szuro_alja_m",
     "RETEG_F": "reteg_teteje_m",
     "RETEG_A": "reteg_alja_m",
-    "TALP": "talp_m",
-    "MAX_TALP": "talp_m",
-    "NYUGALMI": "nyugalmi_vizszint_m",
-    "UZEMI": "uzemi_vizszint_m",
-    "HOMERS": "homerseklet_c",
-    "HOZAM": "hozam_lperc",
-    "EOVX": "eov_x",
-    "EOVY": "eov_y",
-    "TSZF": "tszf_m",
+    "TALP":    "talp_m",
+    "MAX_TALP":"talp_m",
+    "NYUGALMI":"nyugalmi_vizszint_m",
+    "UZEMI":   "uzemi_vizszint_m",
+    "HOMERS":  "homerseklet_c",
+    "HOZAM":   "hozam_lperc",
+    "EOVX":    "eov_x",
+    "EOVY":    "eov_y",
+    "TSZF":    "tszf_m",
     "HELYI NÉV": "telep_nev",
     "HELYI_NÉV": "telep_nev",
     "HELYI_NEV": "telep_nev",
@@ -130,17 +127,17 @@ RESTRICTED_ALLOWED_CANON: Dict[str, List[str]] = {
     "SZURO_F": ["szuro_alja_m"],
     "RETEG_F": ["reteg_teteje_m"],
     "RETEG_A": ["reteg_alja_m"],
-    "TALP": ["talp_m"],
-    "MAX_TALP": ["talp_m"],
-    "VGT1_ObjAz": [],  # never allow to map to vor_kod
+    "TALP":    ["talp_m"],
+    "MAX_TALP":["talp_m"],
+    "VGT1_ObjAz": [],  # safety: never map to vor_kod
 }
-SOURCE_PREF_NUM: Dict[str, List[str]] = {
+SOURCE_PREF_NUM = {
     "szuro_hossz_m": ["SZURO_H"],
     "szuro_teteje_m": ["SZURO_A"],
     "szuro_alja_m": ["SZURO_F"],
     "reteg_teteje_m": ["RETEG_F"],
     "reteg_alja_m": ["RETEG_A"],
-    "talp_m": ["TALP", "MAX_TALP"],
+    "talp_m": ["TALP","MAX_TALP"],
     "eov_x": ["EOVX"],
     "eov_y": ["EOVY"],
     "tszf_m": ["TSZF"],
@@ -149,22 +146,17 @@ SOURCE_PREF_NUM: Dict[str, List[str]] = {
     "homerseklet_c": ["HOMERS"],
     "hozam_lperc": ["HOZAM"],
 }
-SOURCE_PREF_TEXT: Dict[str, List[str]] = {
+SOURCE_PREF_TEXT = {
     "telep_nev": ["HELYI NÉV","HELYI_NÉV","HELYI_NEV","HELYI_NEV (Telep neve)","Telep"],
     "telepules": ["TELEPÜLÉS","TELEPULES","Település","Telep település","TELEPULES_KAT","TELEPÜLÉS_TELEP "],
-    "csoporthely": [
-        "CSOPORTHELY\nmodósítás kék betűvel és cellaszínnel.",
-        "CSOPORTHELY","CSOPHELY","OBJHELY"
-    ],
-    "objcsop_kod": [
-        "OBJCSOPKOD","OBJCSOP","OBJCSOP2018","OBJCSOP2017","OBJCSOP2016","OBJCSOP2015","OBJCSOP2014","OBJCSOP2013"
-    ],
+    "csoporthely": ["CSOPORTHELY\nmodósítás kék betűvel és cellaszínnel.","CSOPORTHELY","CSOPHELY","OBJHELY"],
+    "objcsop_kod": ["OBJCSOPKOD","OBJCSOP","OBJCSOP2018","OBJCSOP2017","OBJCSOP2016","OBJCSOP2015","OBJCSOP2014","OBJCSOP2013"],
     "vor_kod": ["VOR"],
     "vizikonyv_szam": ["VK szám","VK","Vizikönyvi szám","VK szám.1","VK_G","vk"],
     "uzem_engedely_szam": ["ÜZ.ENG.","UZENG","UZENGSZAM","UZENG_SZAM_2015","UZENG_TELEP","UZENGSZAM (telep)"],
     "engedely_szam": ["Engedélyszám","Engedélyszám_Gkód","ÜZENG"],
 }
-NUM_TOL: Dict[str, Tuple[float, float]] = {
+NUM_TOL = {
     "szuro_hossz_m": (1.0, 0.10),
     "szuro_teteje_m": (0.5, 0.05),
     "szuro_alja_m": (0.5, 0.05),
@@ -180,7 +172,7 @@ NUM_TOL: Dict[str, Tuple[float, float]] = {
     "uzemi_vizszint_m": (0.5, 0.05),
 }
 
-# ===================== Utils =====================
+# ---------------------- Utilities --------------------
 def ensure_outdir(path: str):
     os.makedirs(path, exist_ok=True)
 
@@ -190,6 +182,7 @@ def normalize_header(raw: str) -> str:
     s = str(raw).replace("\u00A0", " ")
     s = s.replace("\r", " ").replace("\n", " ")
     s = re.sub(r"\s+", " ", s).strip()
+    # handle "('CSOPHELY',)" formatting from earlier profiling
     m = re.match(r"^\(\s*'([^']+)'\s*,\s*\)$", s)
     if m:
         s = m.group(1)
@@ -214,7 +207,7 @@ def looks_numeric_token(s: str) -> bool:
     return bool(re.search(r"\d", s1))
 
 def parse_number_hu_safe(s) -> Optional[float]:
-    # Robust to pd.NA / NaN / None and strings
+    # robust for pd.NA/NaN/None
     if s is None:
         return None
     try:
@@ -223,7 +216,8 @@ def parse_number_hu_safe(s) -> Optional[float]:
     except Exception:
         pass
     s0 = str(s).strip()
-    m = re.match(r"^[A-Za-z]{1,3}[-/ ]+(\d+)$", s0)  # "K-28" -> 28
+    # e.g. "K-28" → 28
+    m = re.match(r"^[A-Za-z]{1,3}[-/ ]+(\d+)$", s0)
     if m:
         try:
             return float(m.group(1))
@@ -282,7 +276,7 @@ def split_obj_code(s: str) -> Tuple[Optional[str], Optional[float]]:
         return None, float(m2.group(1))
     return None, None
 
-# ================= Heuristic header mapping =================
+# ---------------- Heuristic header mapping -------------
 REGEX_RULES = [
     (r"^VIFIR.*$|^VIFIRKOD.*$|^VIFIRKód.*$", "vifir_kod"),
     (r"^VOR(_.*)?$|^kút VOR$", "vor_kod"),
@@ -341,7 +335,7 @@ def regex_map_header(h: str) -> Optional[str]:
             return target
     return None
 
-# =================== OpenAI Wrapper (timeout-safe) ===================
+# ---------------- OpenAI wrapper (dual SDK) -------------
 _client_new = None
 _client_old = None
 def _init_openai_clients():
@@ -349,10 +343,12 @@ def _init_openai_clients():
     if not OPENAI_KEY:
         return
     try:
+        # New SDK (>=1.0)
         from openai import OpenAI
         _client_new = OpenAI(api_key=OPENAI_KEY)
     except Exception:
         try:
+            # Legacy SDK (<1.0)
             import openai
             openai.api_key = OPENAI_KEY
             _client_old = openai
@@ -368,13 +364,30 @@ def _ai_call_messages(messages: List[dict], response_format_json: bool = True) -
         resp = _client_new.chat.completions.create(**kwargs)
         return resp.choices[0].message.content
     elif _client_old:
+        # legacy API does not support response_format; return raw text
         resp = _client_old.ChatCompletion.create(model=OPENAI_MODEL, temperature=0.0, messages=messages)
         return resp["choices"][0]["message"]["content"]
     else:
         raise RuntimeError("OpenAI client not initialized")
 
-def ai_make_mapping_ambiguous(raw_headers: List[str], context_rows: pd.DataFrame,
+# -------------- AI mapping of ambiguous headers ----------
+def build_profile_hints_from_long(long_df: pd.DataFrame) -> pd.DataFrame:
+    # small hint table for AI: per raw header, inferred type and sample values
+    parts = []
+    for h, g in long_df.groupby("column_name"):
+        vals = g["value"].astype("string")
+        # naive inferred type
+        n_num = vals.map(parse_number_hu_safe).notna().sum()
+        n_text = (vals.map(lambda x: not looks_numeric_token(str(x))) ).sum()
+        inferred = "integer/float" if n_num > n_text else "string"
+        top_vals = "; ".join([f"{k}:{v}" for k, v in vals.value_counts(dropna=False).head(5).items()])
+        parts.append({"column_name": h, "inferred_type": inferred, "files_count": g["file"].nunique(),
+                      "sheets_count": g["sheet"].nunique(), "top_values": top_vals})
+    return pd.DataFrame(parts, dtype="string")
+
+def ai_make_mapping_ambiguous(raw_headers: List[str], hints_df: pd.DataFrame,
                               heur_map: Dict[str, Optional[str]]) -> Dict[str, Optional[str]]:
+    # choose ambiguous only unless AI_MODE=always
     ambiguous = []
     for h in raw_headers:
         hm = heur_map.get(h)
@@ -382,16 +395,13 @@ def ai_make_mapping_ambiguous(raw_headers: List[str], context_rows: pd.DataFrame
             ambiguous.append(h)
 
     if AI_MODE.lower() == "disabled" or not OPENAI_KEY:
-        print("⚙️  AI mapping disabled or no key; using heuristics only.")
+        print("⚙️  AI mapping disabled or no OPENAI_API_KEY; using heuristics only.")
         return {}
 
     to_query = raw_headers if AI_MODE.lower() == "always" else ambiguous
     if not to_query:
         print("🧭 No ambiguous headers; heuristics fully covered.")
         return {}
-
-    keep_cols = [c for c in ["column_name","inferred_type","files_count","sheets_count","top_values"] if c in context_rows.columns]
-    hints_df = context_rows[keep_cols].copy() if keep_cols else pd.DataFrame(columns=["column_name","inferred_type","files_count","sheets_count","top_values"])
 
     _init_openai_clients()
     if not (_client_new or _client_old):
@@ -406,7 +416,7 @@ def ai_make_mapping_ambiguous(raw_headers: List[str], context_rows: pd.DataFrame
 
     with ThreadPoolExecutor(max_workers=1) as pool:
         for idx, chunk in enumerate(chunks, 1):
-            ctx = hints_df[hints_df["column_name"].isin(chunk)].copy() if not hints_df.empty else pd.DataFrame()
+            ctx = hints_df[hints_df["column_name"].isin(chunk)].copy()
             hints = []
             for _, r in ctx.iterrows():
                 hints.append({
@@ -414,17 +424,18 @@ def ai_make_mapping_ambiguous(raw_headers: List[str], context_rows: pd.DataFrame
                     "type": r.get("inferred_type",""),
                     "files": r.get("files_count",""),
                     "sheets": r.get("sheets_count",""),
-                    "examples": str(r.get("top_values",""))[:160]
+                    "examples": str(r.get("top_values",""))[:200]
                 })
             system_msg = (
-                "You are a data integration expert. Map messy headers to EXACTLY one of the 48 canonical fields "
+                "You are a data integration expert. Map each RAW header to EXACTLY one of the 48 canonical fields "
                 "(snake_case list provided). Return ONLY JSON: {\"map\": {\"raw\": \"canonical\"|null}}. "
-                "Safety rules: HELYI_NEV → telep_nev; TELEPULES → telepules; do NOT map TELEPULES to telep_nev; "
+                "Safety rules: HELYI_NEV → telep_nev; TELEPULES → telepules; never map TELEPULES to telep_nev; "
                 "RETEG_F=top, RETEG_A=bottom; SZURO_A=top, SZURO_F=bottom, SZURO_H=length; "
                 "Never map VGT1_ObjAz to vor_kod. If unsure, return null."
             )
             user_payload = {"canonical": canonical_list, "raw_headers": chunk, "profile_hints": hints}
-            messages = [{"role":"system","content": system_msg},{"role":"user","content": json.dumps(user_payload, ensure_ascii=False)}]
+            messages = [{"role":"system","content": system_msg},
+                        {"role":"user","content": json.dumps(user_payload, ensure_ascii=False)}]
 
             print(f"🤖 AI mapping chunk {idx}/{total} (size={len(chunk)}) …", flush=True)
             future = pool.submit(_ai_call_messages, messages, True)
@@ -442,10 +453,10 @@ def ai_make_mapping_ambiguous(raw_headers: List[str], context_rows: pd.DataFrame
                 future.cancel()
             except Exception as e:
                 print(f"⚠️  AI mapping error on chunk {idx}: {e}; continuing.", flush=True)
-            time.sleep(0.2)
+            time.sleep(0.15)
     return ai_map
 
-# ================= Coercion / Casting =================
+# ---------------- Coercion / Casting -------------------
 def coerce_to_canonical(col: str, series: pd.Series) -> pd.Series:
     s = series
     if col in {"datum","ervenyes_tol","ervenyes_ig"}:
@@ -459,12 +470,11 @@ def coerce_to_canonical(col: str, series: pd.Series) -> pd.Series:
         "ev","ho","nap","vizig","objszam","letesites_eve","csoportszam"
     }
     if col in numeric_cols or col == "termeles_ezer_m3ev":
-        # Safe for pd.NA: mapper returns None -> float64 -> NaN
         arr = s.astype("string").map(parse_number_hu_safe).astype("float64")
         if col == "termeles_ezer_m3ev":
             non_null = arr.dropna()
             if len(non_null) >= 5 and non_null.quantile(0.90) > 10000:
-                arr = arr / 1000.0
+                arr = arr / 1000.0  # auto-fix if someone gave m3/yr instead of k m3/yr
         if col == "lekotes_ezer_m3ev":
             non_null = arr.dropna()
             if len(non_null) and non_null.quantile(0.90) > 5000:
@@ -481,7 +491,7 @@ def cast_integral_in_place(df: pd.DataFrame, cols: List[str]):
                 v.loc[mask] = np.round(v.loc[mask])
             df[c] = v.astype("Int64")
 
-# ================= Conflict Selection =================
+# --------------- Conflict selection -------------------
 def almost_equal(a: float, b: float, tol: Tuple[float, float]) -> bool:
     if a is None or b is None:
         return False
@@ -554,8 +564,7 @@ def choose_text_prefer_alpha(canonical: str, candidates: List[Tuple[str, str]],
         pick = select_by_source_priority(cands, priority)
         if pick:
             vals = [v for _, v in cands]
-            # FIX: avoid FutureWarning by converting to Series first
-            uniq_vals = list(pd.Series(vals, dtype="string").dropna().unique())
+            uniq_vals = list(pd.Series(vals, dtype="string").dropna().unique())  # avoid FutureWarning
             if len(uniq_vals) > 1:
                 conflicts.append({
                     "file": file, "sheet": sheet, "row_index": rid, "canonical": canonical,
@@ -570,13 +579,15 @@ def choose_text_prefer_alpha(canonical: str, candidates: List[Tuple[str, str]],
         return alpha[0]
     return cands[0][1]
 
-# =============== Build mapping (locks → heuristics → AI) ===============
-def build_final_mapping(all_headers: List[str], prof: pd.DataFrame) -> Dict[str, Optional[str]]:
+# -------------- Mapping: locks → heuristics → AI -------
+def build_final_mapping(all_headers: List[str], long_df: pd.DataFrame) -> Dict[str, Optional[str]]:
     heur_map: Dict[str, Optional[str]] = {h: regex_map_header(h) for h in all_headers}
+    # enforce restricted
     for h, allowed in RESTRICTED_ALLOWED_CANON.items():
         if h in heur_map and allowed and heur_map[h] not in allowed:
             heur_map[h] = None
 
+    # reuse cached mapping if present
     cached: Dict[str, Optional[str]] = {}
     if os.path.exists(OUT_MAP):
         try:
@@ -589,7 +600,8 @@ def build_final_mapping(all_headers: List[str], prof: pd.DataFrame) -> Dict[str,
         if h in cached and cached[h] in CANONICAL_48:
             heur_map[h] = cached[h]
 
-    ai_map = ai_make_mapping_ambiguous(all_headers, prof, heur_map)
+    hints_df = build_profile_hints_from_long(long_df)
+    ai_map = ai_make_mapping_ambiguous(all_headers, hints_df, heur_map)
 
     final_map: Dict[str, Optional[str]] = {}
     rejected_ai = 0
@@ -618,45 +630,39 @@ def build_final_mapping(all_headers: List[str], prof: pd.DataFrame) -> Dict[str,
     if rejected_ai:
         print(f"🔒 Rejected {rejected_ai} unsafe AI suggestions (protected headers).")
 
-    ensure_outdir(OUT_DIR)
     with open(OUT_MAP, "w", encoding="utf-8") as f:
         json.dump(final_map, f, ensure_ascii=False, indent=2)
     print(f"✅ Saved mapping: {OUT_MAP}")
 
     return final_map
 
-# =========================== MAIN ===========================
+# --------------------------- Main ---------------------
 def main():
-    if not os.path.exists(PROFILE_CSV):
-        raise SystemExit(f"❌ Profile CSV not found: {PROFILE_CSV}")
-    if not os.path.exists(LONG_CSV):
-        raise SystemExit(f"❌ Long CSV not found: {LONG_CSV}")
-
+    warnings.filterwarnings("ignore", category=UserWarning)
     ensure_outdir(OUT_DIR)
 
-    # Load profiles & headers
-    prof = pd.read_csv(PROFILE_CSV, dtype="string", na_filter=False, encoding="utf-8-sig")
-    if "column_name" not in prof.columns:
-        raise SystemExit("❌ 'column_name' column is missing in profile CSV.")
-    prof["column_name"] = prof["column_name"].map(normalize_header)
-    all_headers = sorted(pd.unique(prof["column_name"]).tolist())
-    print(f"🔎 Unique raw headers in profiles: {len(all_headers)}", flush=True)
-
-    final_map = build_final_mapping(all_headers, prof)
-
-    # Load long values
+    # 1) Load long CSV (URL or local file)
+    print(f"📥 Loading long CSV from: {LONG_CSV}", flush=True)
     long_df = pd.read_csv(
         LONG_CSV,
-        dtype={"file":"string","sheet":"string","method":"string","row_index":"string","column_name":"string","value":"string"},
-        na_filter=False, encoding="utf-8-sig", low_memory=False
+        dtype={"file":"string","sheet":"string","method":"string","row_index":"string",
+               "column_name":"string","value":"string"},
+        encoding="utf-8", na_filter=False, low_memory=False
     )
     long_df["column_name"] = long_df["column_name"].map(normalize_header)
+
+    all_headers = sorted(pd.unique(long_df["column_name"]).tolist())
+    print(f"🔎 Unique raw headers detected: {len(all_headers)}", flush=True)
+
+    # 2) Build final raw→canonical mapping
+    final_map = build_final_mapping(all_headers, long_df)
+
+    # 3) Keep only mapped rows
     long_df["canonical"] = long_df["column_name"].map(final_map).astype("string")
-
     kept = long_df[long_df["canonical"].notna()].copy()
-    total_rows = len(long_df)
-    print(f"📦 Rows mapped to canonicals: {len(kept):,} / {total_rows:,}", flush=True)
+    print(f"📦 Rows mapped to canonicals: {len(kept):,} / {len(long_df):,}", flush=True)
 
+    # 4) Row-wise unification
     group_keys = ["file","sheet","row_index"]
     conflicts: List[dict] = []
     out_rows: List[dict] = []
@@ -668,7 +674,7 @@ def main():
             c = r["canonical"]
             cands_by_canon[c].append((r["column_name"], r["value"]))
 
-        # text with priorities
+        # preferred text
         row["telep_nev"]   = choose_text_prefer_alpha("telep_nev",   cands_by_canon["telep_nev"],   f, sh, rid, conflicts, SOURCE_PREF_TEXT.get("telep_nev"))
         row["telepules"]   = choose_text_prefer_alpha("telepules",   cands_by_canon["telepules"],   f, sh, rid, conflicts, SOURCE_PREF_TEXT.get("telepules"))
         row["vizikonyv_szam"] = choose_text_prefer_alpha("vizikonyv_szam", cands_by_canon["vizikonyv_szam"], f, sh, rid, conflicts, SOURCE_PREF_TEXT.get("vizikonyv_szam"))
@@ -678,7 +684,7 @@ def main():
         row["csoporthely"] = select_by_source_priority(cands_by_canon["csoporthely"], SOURCE_PREF_TEXT.get("csoporthely", []))
         row["objcsop_kod"] = select_by_source_priority(cands_by_canon["objcsop_kod"], SOURCE_PREF_TEXT.get("objcsop_kod", []))
 
-        # vor_kod
+        # vor_kod (never from VGT1_ObjAz)
         vor_cands = [(s, v) for s, v in cands_by_canon["vor_kod"] if s != "VGT1_ObjAz"]
         vor_codes = [normalize_value_str(v) for _, v in vor_cands if is_vor_code(v)]
         if vor_codes:
@@ -725,7 +731,7 @@ def main():
             nums = [(src, parse_number_hu_safe(val)) for src, val in cands]
             row[cn] = choose_numeric_safe(cn, nums, f, sh, rid, conflicts)
 
-        # dates
+        # dates (first valid)
         for cn in ["datum","ervenyes_tol","ervenyes_ig"]:
             vals = [normalize_value_str(v) for _, v in cands_by_canon.get(cn, []) if normalize_value_str(v)]
             if not vals:
@@ -741,7 +747,7 @@ def main():
                 row[cn] = choose_text_prefer_alpha(cn, cands_by_canon.get(cn, []), f, sh, rid, conflicts,
                                                    SOURCE_PREF_TEXT.get(cn, []))
 
-        # top/bottom swap if needed
+        # swap top/bottom if inverted
         for top_key, bot_key in [("reteg_teteje_m","reteg_alja_m"), ("szuro_teteje_m","szuro_alja_m")]:
             top = row.get(top_key); bot = row.get(bot_key)
             if isinstance(top, float) and isinstance(bot, float):
@@ -759,33 +765,35 @@ def main():
 
         out_rows.append(row)
 
+    # 5) DataFrame + casting
     wide = pd.DataFrame.from_records(out_rows)
-
-    # ensure all 48 cols exist + coerce types
     for cn in CANONICAL_48:
         if cn not in wide.columns:
             wide[cn] = pd.NA
         wide[cn] = coerce_to_canonical(cn, wide[cn])
-
     cast_integral_in_place(wide, ["objszam","ev","ho","nap","vizig","szuro_db","csoportszam","letesites_eve"])
 
     cols = ["file","sheet","row_index"] + CANONICAL_48
     wide = wide[cols]
 
+    # 6) Persist
     if conflicts:
-        pd.DataFrame(conflicts).to_csv(OUT_CONFLICTS, index=False, encoding="utf-8-sig")
+        pd.DataFrame(conflicts).to_csv(OUT_CONFLICTS, index=False, encoding="utf-8")
         print(f"⚠️  Wrote conflicts: {OUT_CONFLICTS}  ({len(conflicts):,} rows)", flush=True)
     else:
         print("✅ No conflicts recorded (after safe resolution).", flush=True)
 
-    wide.to_csv(OUT_UNIFIED, index=False, encoding="utf-8-sig")
+    wide.to_csv(OUT_UNIFIED, index=False, encoding="utf-8")
     print(f"✅ Wrote unified table: {OUT_UNIFIED}  ({len(wide):,} rows, {len(wide.columns)} cols)", flush=True)
 
-    # AI validation (best-effort)
+    # 7) Short AI validation note (optional)
     try:
+        if not OPENAI_KEY or AI_MODE.lower() == "disabled":
+            raise RuntimeError("AI disabled or no OPENAI_API_KEY")
         _init_openai_clients()
-        if not (_client_new or _client_old) or AI_MODE.lower() == "disabled":
-            raise RuntimeError("AI disabled or unavailable")
+        if not (_client_new or _client_old):
+            raise RuntimeError("OpenAI SDK unavailable")
+
         prof2 = []
         for cn in CANONICAL_48:
             ser = wide[cn]
@@ -796,10 +804,10 @@ def main():
         msg = {
             "summary": {"rows": len(wide), "conflicts": len(conflicts)},
             "columns": prof2,
-            "policy": "Priority source rules; text-over-numeric for names; OBJSZAM→(obj_tipus,objszam); VOR patterns; locked headers."
+            "policy": "Priority text sources; OBJSZAM parsed (K-28→28); vor_kod pattern-checked; top/bottom swap; screen length from bounds."
         }
         messages = [
-            {"role":"system","content":"Audit the 48-column unification. Short markdown with coverage and remaining caveats."},
+            {"role":"system","content":"Audit the 48-column unification. Produce a short markdown note with coverage & caveats."},
             {"role":"user","content": json.dumps(msg, ensure_ascii=False)}
         ]
         with ThreadPoolExecutor(max_workers=1) as pool:
